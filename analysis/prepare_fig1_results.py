@@ -20,7 +20,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--label-column", default="label")
     p.add_argument("--score-column", default="p_pvc")
     p.add_argument("--person-column", default="patient_id")
-    p.add_argument("--sample-column", default=None)
+    p.add_argument("--sample-column", default="sample_id")
+    p.add_argument("--split", default="test",
+                   help="If the input has a 'split' column, keep only this split (held-out test).")
     return p.parse_args()
 
 
@@ -31,6 +33,11 @@ def main() -> None:
     missing = required.difference(df.columns)
     if missing:
         raise ValueError(f"Missing columns in {args.input}: {sorted(missing)}")
+
+    if "split" in df.columns and args.split:
+        df = df[df["split"].astype(str).str.lower() == args.split.lower()].reset_index(drop=True)
+        if df.empty:
+            raise ValueError(f"No rows with split == '{args.split}'.")
 
     out = pd.DataFrame({
         "task": args.task,

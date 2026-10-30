@@ -14,14 +14,20 @@ import matplotlib.pyplot as plt
 import json
 from io import StringIO
 from tqdm import tqdm
-import time
+import time # Added for runtime calculation
 
-# fvcore is optional; it is only used to report FLOPs.
+# Added for FLOPs calculation
 try:
     from fvcore.nn import FlopCountAnalysis
 except ImportError:
     FlopCountAnalysis = None
 
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "pvc" / "utils" / "model_arch"))
+from himae import HiMAE as _SharedHiMAE, PAPER_CONFIG  # noqa: E402
 
 import lightning as L
 from lightning.pytorch.loggers import WandbLogger
@@ -33,8 +39,7 @@ import boto3
 os.environ['HDF5_USE_FILE_LOCKING'] = 'FALSE'
 warnings.filterwarnings("ignore")
 
-# Path to the consolidated pretraining metadata file. Set this before running.
-CONSOLIDATED_METADATA_PATH = ''
+CONSOLIDATED_METADATA_PATH = '' # PRETRAINING DATASOURCE
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(funcName)s: %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 logger = logging.getLogger(__name__)
@@ -137,97 +142,26 @@ class PPGOnlyDataModule(L.LightningDataModule):
         return DataLoader(self.test_dataset, batch_size=self.hparams.batch_size, shuffle=False, num_workers=self.hparams.num_workers, pin_memory=True, persistent_workers=True)
 
 
-class ResConvBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, stride=2):
-        super().__init__()
-        padding = 2
-        self.main_path = nn.Sequential(
-            nn.Conv1d(in_channels, out_channels, kernel_size=5, stride=stride, padding=padding, bias=False),
-            nn.BatchNorm1d(out_channels),
-            nn.GELU(),
-            nn.Conv1d(out_channels, out_channels, kernel_size=5, stride=1, padding=padding, bias=False),
-            nn.BatchNorm1d(out_channels)
-        )
-        self.shortcut = nn.Sequential()
-        if stride != 1 or in_channels != out_channels:
-            self.shortcut = nn.Sequential(
-                nn.Conv1d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm1d(out_channels)
-            )
-        self.final_activation = nn.GELU()
+class HiMAE(_SharedHiMAE):
+    """Tensor-in / tensor-out view of the shared HiMAE definition used for pretraining.
+
+    The architecture lives in pvc/utils/model_arch/himae.py (PAPER_CONFIG), so the
+    pretraining model, the released checkpoint and all downstream code share one
+    definition and identical state-dict keys.
+    """
+    def __init__(self, in_chans=1, seq_len=PAPER_CONFIG["sampling_freq"] * PAPER_CONFIG["seg_len"],
+                 channels=PAPER_CONFIG["channels"], kernel_size=PAPER_CONFIG["kernel_size"],
+                 stride=PAPER_CONFIG["stride"], patch_len=PAPER_CONFIG["patch_len"]):
+        if in_chans != 1:
+            raise ValueError("Pretraining uses single-channel PPG (in_chans=1).")
+        super().__init__({
+            "source": "ppg", "sampling_freq": seq_len, "seg_len": 1,
+            "model_params": {"channels": tuple(channels), "kernel_size": kernel_size,
+                             "stride": stride, "patch_len": patch_len},
+        })
 
     def forward(self, x):
-        main_out = self.main_path(x)
-        shortcut_out = self.shortcut(x)
-        if main_out.size() != shortcut_out.size():
-            target_size = main_out.size()[2]
-            shortcut_out = shortcut_out[:, :, :target_size]
-        return self.final_activation(main_out + shortcut_out)
-
-
-class DecoderSkipBlock(nn.Module):
-    def __init__(self, in_channels, skip_channels, out_channels):
-        super().__init__()
-        self.upconv = nn.ConvTranspose1d(in_channels, out_channels, kernel_size=5, stride=2, padding=2, output_padding=1)
-        self.conv_block = nn.Sequential(
-            nn.Conv1d(out_channels + skip_channels, out_channels, kernel_size=5, padding=2, bias=False),
-            nn.BatchNorm1d(out_channels),
-            nn.GELU(),
-            nn.Conv1d(out_channels, out_channels, kernel_size=5, padding=2, bias=False),
-            nn.BatchNorm1d(out_channels),
-            nn.GELU()
-        )
-
-    def forward(self, x, skip_connection):
-        x = self.upconv(x)
-        if x.size() != skip_connection.size():
-            target_size = skip_connection.size()[2]
-            x = x[:, :, :target_size]
-        x = torch.cat([x, skip_connection], dim=1)
-        return self.conv_block(x)
-
-
-class HiMAE(nn.Module):
-    def __init__(self, in_chans=1, seq_len=750, channels=[16, 32, 64, 128]):
-        super().__init__()
-        self.seq_len = seq_len
-        self.encoder_layers = nn.ModuleList()
-        self.decoder_layers = nn.ModuleList()
-
-        current_chans = in_chans
-        for chan in channels:
-            self.encoder_layers.append(ResConvBlock(current_chans, chan, stride=2))
-            current_chans = chan
-
-        reversed_channels = channels[::-1]
-        for i in range(len(reversed_channels) - 1):
-            in_c, skip_c, out_c = reversed_channels[i], reversed_channels[i+1], reversed_channels[i+1]
-            self.decoder_layers.append(DecoderSkipBlock(in_c, skip_c, out_c))
-
-        self.final_deconv = nn.ConvTranspose1d(channels[0], in_chans, kernel_size=5, stride=2, padding=2, output_padding=1)
-        self.final_activation = nn.Tanh()
-
-    def forward(self, x):
-        skip_connections = []
-        current_x = x
-        for encoder_block in self.encoder_layers:
-            current_x = encoder_block(current_x)
-            skip_connections.append(current_x)
-
-        bottleneck = skip_connections.pop()
-        skip_connections = skip_connections[::-1]
-
-        current_x = bottleneck
-        for i, decoder_block in enumerate(self.decoder_layers):
-            skip = skip_connections[i]
-            current_x = decoder_block(current_x, skip)
-
-        x_reconstructed = self.final_deconv(current_x)
-
-        if x_reconstructed.shape[-1] != self.seq_len:
-            x_reconstructed = nn.functional.interpolate(x_reconstructed, size=self.seq_len, mode='linear', align_corners=False)
-
-        return self.final_activation(x_reconstructed)
+        return self.reconstruct(x)
 
 
 class HiMAELightningModule(L.LightningModule):
@@ -237,7 +171,10 @@ class HiMAELightningModule(L.LightningModule):
         self.model = HiMAE(
             in_chans=self.hparams.C,
             seq_len=self.hparams.T * self.hparams.f_s,
-            channels=self.hparams.channels
+            channels=self.hparams.channels,
+            kernel_size=self.hparams.get('kernel_size', PAPER_CONFIG['kernel_size']),
+            stride=self.hparams.get('stride', PAPER_CONFIG['stride']),
+            patch_len=self.hparams.patch,
         )
         self.patch_size = self.hparams.patch
         self.seq_len = self.hparams.T * self.hparams.f_s
@@ -390,6 +327,7 @@ class HiMAEReconstructionVisualizer(L.Callback):
         trainer.logger.experiment.log(plots_to_log, commit=False)
         pl_module.train()
 
+# --- New Callback for timing epochs ---
 class EpochTimer(L.Callback):
     """Callback to time each training epoch and log the duration."""
     def __init__(self):
@@ -415,9 +353,9 @@ def main_HiMAE():
 
     cnn_args = dict(
         consolidated_meta_path=CONSOLIDATED_METADATA_PATH,
-        f_s=100, T=10, patch=5, C=1,
-        channels=[16, 32, 64, 128, 256],
-        mask_ratio=0.8, block_mask_prob=0.5, num_mask_blocks=4, batch_size=1024, pretrain_epochs=300, patience=3,
+        f_s=PAPER_CONFIG['sampling_freq'], T=PAPER_CONFIG['seg_len'], patch=PAPER_CONFIG['patch_len'], C=1,
+        channels=list(PAPER_CONFIG['channels']), kernel_size=PAPER_CONFIG['kernel_size'], stride=PAPER_CONFIG['stride'],
+        mask_ratio=PAPER_CONFIG['mask_ratio'], block_mask_prob=0.5, num_mask_blocks=4, batch_size=1024, pretrain_epochs=300, patience=3,
         lr=1e-3, weight_decay=1e-3,
         num_workers=max(1, os.cpu_count() // 8), train_frac=0.8, test_frac=0.1,
         warmup_ratio=0.1
@@ -432,22 +370,23 @@ def main_HiMAE():
 
     model = HiMAELightningModule(hparams=cnn_args)
 
-    # FLOPs per forward pass (skipped if fvcore is unavailable).
+    # --- FLOPs Calculation ---
     total_flops = 0
     flops_analyzer = None
     if FlopCountAnalysis:
         try:
-            # Random input with the model's expected shape (B, C, L).
+            # Create a dummy input with the correct shape for the model (B, C, L)
             seq_len = cnn_args['f_s'] * cnn_args['T']
             C = cnn_args['C']
             dummy_input = torch.randn(1, C, seq_len)
             
-            # Analyze the underlying nn.Module rather than the LightningModule.
+            # Analyze the nn.Module part of the LightningModule
             flops_analyzer = FlopCountAnalysis(model.model, dummy_input)
             total_flops = flops_analyzer.total()
 
         except Exception as e:
             logger.error(f"Could not calculate FLOPs: {e}")
+    # --- End FLOPs Calculation ---
 
 
     wandb_logger = WandbLogger(project="HIMAE_test", log_model="all")
@@ -462,6 +401,7 @@ def main_HiMAE():
         every_n_epochs=1
     )
     
+    # --- Instantiate the new epoch timer callback ---
     epoch_timer_callback = EpochTimer()
 
     trainer = L.Trainer(
@@ -473,12 +413,12 @@ def main_HiMAE():
             ModelCheckpoint(monitor='val/mse_loss', mode='min', save_top_k=-1, filename='best-cnn-mae-model'),
             EarlyStopping(monitor='val/mse_loss', patience=cnn_args['patience'], mode='min'),
             visualizer_callback,
-            epoch_timer_callback,
+            epoch_timer_callback # Add the timer callback to the trainer
         ]
     )
 
     training_duration = 0
-    start_time = time.time()
+    start_time = time.time() # Record start time
     
     try:
         logger.info("Starting HIMAE pre-training...")
@@ -489,10 +429,10 @@ def main_HiMAE():
         logger.error(f"An error occurred during training: {e}")
 
     finally:
-        end_time = time.time()
+        end_time = time.time() # Record end time
         training_duration = end_time - start_time
         
-        # Runtime and FLOPs summary.
+        # --- Runtime and FLOPs Reporting ---
         hours, rem = divmod(training_duration, 3600)
         minutes, seconds = divmod(rem, 60)
         logger.info("\n--- Training Summary ---")
@@ -500,12 +440,14 @@ def main_HiMAE():
         
         if total_flops > 0 and flops_analyzer is not None:
             logger.info(f"Total FLOPs per forward pass: {total_flops / 1e9:.2f} GFLOPs")
+            # --- More explicit FLOPs breakdown ---
             logger.info("--- FLOPs Breakdown by Module ---")
             logger.info(flops_analyzer.by_module())
             logger.info("---------------------------------")
         logger.info("------------------------\n")
+        # --- End Reporting ---
 
-        # Plot per-epoch training time.
+        # --- Plotting Epoch Times ---
         if epoch_timer_callback.epoch_times:
             logger.info("Generating plot for epoch training times...")
             try:
@@ -516,14 +458,16 @@ def main_HiMAE():
                 plt.xlabel('Epoch')
                 plt.ylabel('Time (seconds)')
                 plt.grid(True)
+                # Ensure x-axis ticks are integers
                 plt.xticks(list(num_epochs_completed))
                 plt.tight_layout()
                 plot_filename = 'epoch_times.png'
                 plt.savefig(plot_filename)
-                plt.close()
+                plt.close() # Close the figure to free up memory
                 logger.info(f"Epoch times plot saved to {plot_filename}")
             except Exception as e:
                 logger.error(f"Failed to generate epoch times plot: {e}")
+        # --- End Plotting ---
 
         logger.info("Cleaning up resources...")
         wandb.finish()

@@ -1,8 +1,12 @@
 """Generate long-form few-shot AUROC CSVs consumed by ``plot/fig4.py``.
 
-Example (synthetic PVC files shipped with this repository)::
+Inputs are resampled to the pretraining configuration (PAPER_CONFIG: 100 Hz,
+10-second windows, patch size 5) before every forward pass. The stored sampling
+rate is inferred from the window length unless --input-fs is given.
 
-    python pvc/downstream_eval/fewshot_adaptation.py \
+Example (synthetic PVC files shipped with this repository; 25 Hz -> 100 Hz)::
+
+    python pvc/downstream_eval/fewshot_finetune.py \
         --h5 pvc_10s_synth.h5 \
         --checkpoint himae_synth.ckpt \
         --dataset PVC \
@@ -26,13 +30,11 @@ import sys
 from pathlib import Path
 from typing import Iterable
 
-import h5py
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 from sklearn.metrics import roc_auc_score
-from sklearn.model_selection import GroupShuffleSplit
 from torch.utils.data import DataLoader, Dataset
 
 # Allow execution from anywhere inside/outside the repository.
@@ -40,7 +42,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from pvc.utils.model_arch.himae import HiMAE  # noqa: E402
+from pvc.utils.model_arch.himae import HiMAE, PAPER_CONFIG  # noqa: E402
+from pvc.utils.signal_utils import load_h5_windows, participant_disjoint_split  # noqa: E402
 
 
 OUTPUT_COLUMNS = ["dataset", "model", "shots", "run", "auc"]
@@ -58,9 +61,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--signal-key", default="ppg")
     parser.add_argument("--label-key", default="labels")
     parser.add_argument("--patient-key", default="patient_ids")
-    parser.add_argument("--sampling-freq", type=int, default=25)
-    parser.add_argument("--segment-seconds", type=int, default=10)
-    parser.add_argument("--patch-len", type=int, default=50)
+    parser.add_argument("--input-fs", type=int, default=None,
+                        help="Sampling rate of the stored windows (inferred from length if omitted).")
+    parser.add_argument("--sampling-freq", type=int, default=PAPER_CONFIG["sampling_freq"],
+                        help="Model input rate; windows are resampled to this rate.")
+    parser.add_argument("--segment-seconds", type=int, default=PAPER_CONFIG["seg_len"])
+    parser.add_argument("--patch-len", type=int, default=PAPER_CONFIG["patch_len"])
+    parser.add_argument("--embedding-stage", default="last",
+                        help='Encoder stage pooled for the classifier: "last" (bottleneck), '
+                             'a stage number 1-5, or "all" (concatenation of all stages).')
     parser.add_argument(
         "--shots",
         nargs="+",
@@ -114,71 +123,6 @@ def choose_device(name: str) -> torch.device:
     return torch.device("cpu")
 
 
-def minmax_per_window(x: np.ndarray) -> np.ndarray:
-    x = np.asarray(x, dtype=np.float32)
-    lo = x.min(axis=1, keepdims=True)
-    hi = x.max(axis=1, keepdims=True)
-    scale = np.maximum(hi - lo, 1e-8)
-    return 2.0 * (x - lo) / scale - 1.0
-
-
-def load_arrays(
-    path: Path, signal_key: str, label_key: str, patient_key: str
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    with h5py.File(path, "r") as h5:
-        x = np.asarray(h5[signal_key][:], dtype=np.float32)
-        y = np.asarray(h5[label_key][:]).reshape(-1).astype(np.int64)
-        if patient_key in h5:
-            patient_ids = np.asarray(h5[patient_key][:]).reshape(-1)
-        else:
-            patient_ids = np.arange(len(y))
-
-    if x.ndim == 3 and x.shape[1] == 1:
-        x = x[:, 0, :]
-    if x.ndim != 2:
-        raise ValueError(f"Expected signals [N,L] or [N,1,L], got {x.shape}")
-    if not (len(x) == len(y) == len(patient_ids)):
-        raise ValueError("Signal, label, and participant arrays have different lengths.")
-    if np.unique(y).size != 2:
-        raise ValueError(f"This runner expects binary labels; found {np.unique(y)}")
-
-    return minmax_per_window(x), y, patient_ids
-
-
-def participant_disjoint_split(
-    y: np.ndarray,
-    groups: np.ndarray,
-    test_fraction: float,
-    val_fraction: float,
-    seed: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Create fixed participant-disjoint train/val/test indices."""
-    all_idx = np.arange(len(y))
-    outer = GroupShuffleSplit(n_splits=1, test_size=test_fraction, random_state=seed)
-    train_val_rel, test_rel = next(outer.split(all_idx, y, groups=groups))
-
-    train_val_idx = all_idx[train_val_rel]
-    test_idx = all_idx[test_rel]
-    train_val_groups = groups[train_val_idx]
-    train_val_y = y[train_val_idx]
-
-    # val_fraction is interpreted as a fraction of the non-test pool.
-    inner = GroupShuffleSplit(n_splits=1, test_size=val_fraction, random_state=seed + 1)
-    train_rel, val_rel = next(
-        inner.split(train_val_idx, train_val_y, groups=train_val_groups)
-    )
-    train_idx = train_val_idx[train_rel]
-    val_idx = train_val_idx[val_rel]
-
-    for name, idx in [("train", train_idx), ("validation", val_idx), ("test", test_idx)]:
-        if np.unique(y[idx]).size != 2:
-            raise RuntimeError(
-                f"{name} split contains only one class. Change --split-seed or split fractions."
-            )
-
-    return train_idx, val_idx, test_idx
-
-
 class ArrayDataset(Dataset):
     def __init__(self, x: np.ndarray, y: np.ndarray, indices: np.ndarray):
         self.x = x
@@ -194,16 +138,26 @@ class ArrayDataset(Dataset):
 
 
 class EncoderClassifier(nn.Module):
-    def __init__(self, backbone: HiMAE):
+    """Linear head on a time-pooled encoder stage (or the concatenation of all stages)."""
+
+    def __init__(self, backbone: HiMAE, stage: str = "last"):
         super().__init__()
         self.backbone = backbone
-        self.classifier = nn.Linear(256, 1)
+        n = len(backbone.channels)
+        if stage == "last":
+            self.stages = [n - 1]
+        elif stage == "all":
+            self.stages = list(range(n))
+        else:
+            k = int(stage)
+            if not 1 <= k <= n:
+                raise ValueError(f"--embedding-stage must be 1..{n}, 'last' or 'all'")
+            self.stages = [k - 1]
+        self.classifier = nn.Linear(sum(backbone.channels[i] for i in self.stages), 1)
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        current = x.unsqueeze(1) if x.ndim == 2 else x
-        for block in self.backbone.encoder_layers:
-            current = block(current)
-        return current.mean(dim=-1)
+        feats = self.backbone.encode(x.unsqueeze(1) if x.ndim == 2 else x)
+        return torch.cat([feats[i].mean(dim=-1) for i in self.stages], dim=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.classifier(self.encode(x)).squeeze(-1)
@@ -378,8 +332,9 @@ def main() -> None:
     shots = normalize_shots(args.shots)
     print(f"Device: {device}")
 
-    x, y, patient_ids = load_arrays(
-        args.h5, args.signal_key, args.label_key, args.patient_key
+    x, y, patient_ids = load_h5_windows(
+        args.h5, args.signal_key, args.label_key, args.patient_key,
+        input_fs=args.input_fs, model_fs=args.sampling_freq, seg_len=args.segment_seconds,
     )
     train_idx, val_idx, test_idx = participant_disjoint_split(
         y,
@@ -403,7 +358,7 @@ def main() -> None:
 
         if args.include_frozen:
             backbone = build_backbone(args, device)
-            model = EncoderClassifier(backbone).to(device)
+            model = EncoderClassifier(backbone, args.embedding_stage).to(device)
             frozen_train_loader = make_loader(
                 x, y, train_idx, args.batch_size, shuffle=True
             )
@@ -431,7 +386,7 @@ def main() -> None:
             )
             train_loader = make_loader(x, y, subset, args.batch_size, shuffle=True)
             backbone = build_backbone(args, device)
-            model = EncoderClassifier(backbone).to(device)
+            model = EncoderClassifier(backbone, args.embedding_stage).to(device)
             model = train_model(
                 model,
                 train_loader,

@@ -21,7 +21,9 @@ Input schemas are given below. All stochastic steps use seed `2024` and `B = 1,0
 | Fig. 3 CIs, paired ΔTP (Results §2.3); Extended Data Tables 3–6 | `analysis/bootstrap_operating_points.py` | predictions schema + `validation_thresholds.csv` | 2024 | `results/operating_points_bootstrap.csv`, `results/operating_points_paired_tp.csv` |
 | Fig. 4 (few-shot curves) | `pvc/downstream_eval/fewshot_finetune.py` → `plot/fig4.py` | HDF5 windows + HiMAE checkpoint | `--split-seed 77`, `--run-seed 1000` (+run index) | `results/finetuning.csv`, `figures/fewshot_<dataset>.{png,pdf}` |
 | Extended Data Figs. 1–3 (confusion matrices) | `plot/e-fig1_3.py` | `results/operating_points.csv`-style counts | none | `figures/extended_figure1_3.{png,pdf}`, `figures/extended_figure1_3_summary.csv` |
-| Synthetic PVC linear probe + prediction export | `HiMAE_PVC_Detection.ipynb`, `pvc/downstream_eval/binary_linear_prob.py` | `pvc_10s_synth.h5`, `himae_synth.ckpt` | see script | `pvc_predictions.csv`, `pvc_linear_probe.pt` |
+| Synthetic PVC linear probe + prediction export | `HiMAE_PVC_Detection.ipynb` | `pvc_10s_synth.h5`, `himae_synth.ckpt` | `SEED=7`, `SPLIT_SEED=77` | `results/pvc_predictions.csv`, `results/pvc_linear_probe.pt` |
+| Multi-resolution embeddings / resolution hypothesis | `pvc/downstream_eval/multiresolution_probe.py` → `plot/fig_multiresolution.py` | HDF5 windows + HiMAE checkpoint | `--split-seed 77`, bootstrap `--seed 2024` | `results/multiresolution/multires_probe_summary.csv`, `multires_probe_paired.csv`, `multires_predictions.csv`, `figures/multiresolution_probe.{png,pdf}` |
+| Architecture matches main text | `tests/test_architecture.py` | `himae_synth.ckpt` | none | pytest pass/fail |
 | HiMAE pretraining | `pretrain/himae.py` | unlabeled 10-s PPG windows | `set_seed(42)` | Lightning checkpoint |
 | Table 1, parameters / memory / FLOPs (HiMAE) | `analysis/model_complexity.py` | model definition only (needs PyTorch) | none | `results/model_complexity.csv`, optional `--static-output` for `summarize_device_energy.py --static` |
 
@@ -37,6 +39,34 @@ task,model,regime,split,person_id,y_true,y_score[,sample_id]
 - `sample_id`: window identifier within participant. Paired analyses require every model in a task/regime to be scored on the same test windows.
 
 Build a combined table from per-model exports with `analysis/merge_predictions.py`.
+
+## Architecture configuration
+
+`pvc/utils/model_arch/himae.py` defines `PAPER_CONFIG`, the configuration reported in the Methods, and is the only HiMAE definition in the repository: `pretrain/himae.py` subclasses it, and the notebook, probes and few-shot scripts instantiate it with these defaults.
+
+| Main text (Methods) | `PAPER_CONFIG` | Released checkpoint `himae_synth.ckpt` |
+|---|---|---|
+| 10-s windows at 100 Hz (1,000 samples) | `sampling_freq=100`, `seg_len=10` | `f_s=100`, `T=10` |
+| Channel hierarchy [16, 32, 64, 128, 256] | `channels=(16, 32, 64, 128, 256)` | same |
+| Kernel size 5, stride 2 | `kernel_size=5`, `stride=2` | same (weights shape-checked) |
+| Patch size 5, masking ratio 0.8 | `patch_len=5`, `mask_ratio=0.8` | `patch=5`, `mask_ratio=0.8` |
+| 1.2M parameters | 1,245,953 | loads with `strict=True` |
+
+Downstream data stored at other rates (the synthetic PVC file is 25 Hz) are resampled to 100 Hz by `pvc/utils/signal_utils.py` before every forward pass. `python -m pytest tests -q` verifies all of the above.
+
+## Multi-resolution embeddings (resolution hypothesis)
+
+**Scripts:** `pvc/downstream_eval/multiresolution_probe.py`, `plot/fig_multiresolution.py`; interactive version in the notebook.
+
+```bash
+python pvc/downstream_eval/multiresolution_probe.py --h5 pvc_10s_synth.h5 --checkpoint himae_synth.ckpt \
+  --task PVC --output-dir results/multiresolution
+python plot/fig_multiresolution.py --input results/multiresolution/multires_probe_summary.csv --output-dir figures
+```
+
+**Method:** `HiMAE.encode()` returns the feature map of each of the five encoder stages; stage *k* has temporal step 2^k samples and receptive field 13, 37, 85, 181, 373 samples (130 ms – 3.73 s at 100 Hz). Each stage is mean-pooled over time (`--pooling mean|max|meanmax`) and probed with standardized L2 logistic regression (C chosen on validation AUROC); the concatenation of all stages is probed as well. The best stage is selected on the validation split only. Test AUROC has participant-level bootstrap 95% CIs (1,000 replicates), and paired ΔAUROC against the bottleneck (stage 5) uses the same P-value definition as `analysis/bootstrap_auc.py`. Splits are participant-disjoint and identical to `fewshot_finetune.py` (`--split-seed 77`). `fewshot_finetune.py --embedding-stage {last,1..5,all}` runs frozen/fine-tuned evaluation on any stage.
+
+**Outputs:** `multires_probe_summary.csv` (per stage: channels, downsampling, receptive field, val/test AUROC, CI, selected-on-validation flag); `multires_probe_paired.csv`; `multires_predictions.csv` (prediction schema with `regime = "Frozen (stageK)"`, usable with the operating-point scripts).
 
 ## HiMAE pretraining
 

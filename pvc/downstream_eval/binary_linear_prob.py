@@ -1,9 +1,3 @@
-"""Linear-probe evaluation of a frozen pretrained backbone on binary downstream tasks.
-
-Runs k-fold cross-validation with either a random (segment-level) split or a
-patient-level split, and logs F1, AUROC, and accuracy per fold and on average.
-"""
-
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
@@ -46,9 +40,8 @@ import argparse
 import logging
 
 
+# # # for himae
 class HIMAE_(nn.Module):
-    """Linear classifier on time-pooled bottleneck features of a frozen HiMAE encoder."""
-
     def __init__(self, backbone, num_classes):
         super().__init__()
         self.backbone = backbone
@@ -67,13 +60,13 @@ class HIMAE_(nn.Module):
                 skip_connections.append(current_x)
     
             bottleneck = skip_connections.pop()
+            # mylogger.info(bottleneck.shape)
 
         return self.classifier(bottleneck.mean(-1))
 
 
+# for pulsebridge
 class PULSE_(nn.Module):
-    """Linear classifier on the PPG embedding of a frozen PulseBridge backbone."""
-
     def __init__(self, backbone, num_classes):
         super().__init__()
         self.backbone = backbone
@@ -114,28 +107,37 @@ def print_h5_structure(h5_object, indent=0):
             mylogger.info(f"{prefix}[UNKNOWN] {key}")
 
 def _read_one_h5_from_local(bucket_name, s3_key):
-    """Open an HDF5 file from a local mirror of the bucket, falling back to S3."""
+              
     path = '../' + os.path.join(bucket_name, s3_key)
         
+    # 1. Check if the local file exists
     if not os.path.exists(path):
         mylogger.info('Local copy not found, reading from s3...')
         return _read_one_h5_from_s3(bucket_name, s3_key)
 
+    # 2. Open the file directly from disk
     h5_file = h5py.File(path, 'r')
     print_h5_structure(h5_file)
     return h5_file
 
     
 def _read_one_h5_from_s3(bucket_name, s3_key):
-    """Download an HDF5 object from S3 into memory and open it with h5py."""
+    
+
     try:
+        # 1. Create an S3 client
         s3_client = boto3.client('s3')
 
+        # 2. Get the object from S3
         response = s3_client.get_object(Bucket=bucket_name, Key=s3_key)
         
+        # 3. Read the object's content into an in-memory buffer
+        # The 'Body' of the response is a streaming object
         file_content = response['Body'].read()
         buffer = io.BytesIO(file_content)
         
+        # 4. Open the buffer with h5py as if it were a file
+        # mylogger.info(f"Successfully loaded {s3_key} from bucket {bucket_name} into memory.")
         h5_file = h5py.File(buffer, 'r')
         print_h5_structure(h5_file)
         return h5_file
@@ -163,26 +165,29 @@ def get_hypertension_label(sbp, dbp):
     DBP_THRESHOLD = 80
     EXCLUSION_ZONE = 8
 
+    # Define the final boundaries after applying the exclusion zone
     sbp_upper_bound = SBP_THRESHOLD + EXCLUSION_ZONE  # 138
     sbp_lower_bound = SBP_THRESHOLD - EXCLUSION_ZONE  # 122
     
     dbp_upper_bound = DBP_THRESHOLD + EXCLUSION_ZONE  # 88
     dbp_lower_bound = DBP_THRESHOLD - EXCLUSION_ZONE  # 72
 
+    # Rule for clear hypertension
     if sbp >= sbp_upper_bound or dbp >= dbp_upper_bound:
         return 1  # Hypertension
         
+    # Rule for clear normal
     elif sbp <= sbp_lower_bound and dbp <= dbp_lower_bound:
         return 0  # Normal
         
+    # All other cases fall into the exclusion zone
     else:
-        return None  # Excluded
+        return None # Excluded
 
 
 
 
 def min_max_norm(signal):
-    """Scale a signal to the range [-1, 1]."""
     min_val = signal.min()
     max_val = signal.max()
     return 2 * (signal - min_val) / (max_val - min_val) - 1
@@ -190,7 +195,7 @@ def min_max_norm(signal):
             
 
 def _upsample(original_signal, fs_original=25, fs_new=100, duration=10):
-    """Resample a signal from ``fs_original`` to ``fs_new`` unless it is already at the target length."""
+
     if len(original_signal) == fs_new * duration:
         return original_signal
     
@@ -206,7 +211,6 @@ def _upsample(original_signal, fs_original=25, fs_new=100, duration=10):
 
 
 def update_bp_labels(labels):
-    """Map (id, SBP, DBP) rows to binary hypertension labels, dropping excluded rows."""
     keep_idx = []
     new_labels = []
     for i, (_, sbp, dbp) in enumerate(labels):
@@ -220,7 +224,7 @@ def update_bp_labels(labels):
 
 
 def metrics_by_patient(test_patients, all_test_preds, all_test_probs, all_test_labels, args):
-    """Compute accuracy, AUROC, and F1 per patient and return their means."""
+
     def get_average(d, key='acc'):
         return np.mean([v[key] for uid, v in d.items()])
         
@@ -238,6 +242,7 @@ def metrics_by_patient(test_patients, all_test_preds, all_test_probs, all_test_l
         patient_probs[patient_id].append(all_test_probs[i])
         patient_labels[patient_id].append(all_test_labels[i])
 
+    # Calculate per-patient accuracy for this fold
     out = {}
     
     for pid in patient_preds:
@@ -278,6 +283,7 @@ class ClassificationDataset(Dataset):
         return len(self.labels)
 
     def __getitem__(self, idx):
+        # Convert to tensors here
         signal = min_max_norm(self.ppg[idx])
         signal = _upsample(signal, fs_original=TASK_DEF[self.app]['fs'])
         signal = torch.from_numpy(signal).float()
@@ -290,7 +296,8 @@ class ClassificationDataset(Dataset):
 
 
 def prepare_data(args, h5_buffer):
-    """Load signals, patient IDs, and labels from the HDF5 file into memory."""
+
+    ''' data loader '''
     all_ppg = h5_buffer['ppg'][:]
     all_patient_ids = h5_buffer['patient_ids'][:]
     all_labels = h5_buffer['labels'][:]
@@ -310,13 +317,13 @@ def prepare_data(args, h5_buffer):
 
 
 def run_linear_probe_random(args, h5_buffer):
-    """Linear-probe k-fold CV with stratified segment-level splits."""
+    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     mylogger.info(f"Using device: {device}")
     
     all_ppg, all_patient_ids, all_labels = prepare_data(args, h5_buffer)
     
-    # Load backbone weights from the Lightning checkpoint.
+    ''' backbone loader '''
     backbone = get_model(args.cfg)
     checkpoint = torch.load(args.ckpt_path, map_location=device)
     lightning_state_dict = checkpoint['state_dict']
@@ -325,21 +332,26 @@ def run_linear_probe_random(args, h5_buffer):
     mylogger.info("Backbone loaded successfully.")
 
     
+    # --- K-Fold Cross-Validation Setup ---
     sgkf = StratifiedKFold(n_splits=args.k_folds, shuffle=True, random_state=args.seed)
+    # sgkf = KFold(n_splits=args.k_folds, shuffle=True, random_state=args.seed)
     
     fold_metrics = {'f1': [], 'auroc': [], 'acc': []}
 
+    # --- Main K-Fold Loop ---
     for fold, (train_val_idx, test_idx) in enumerate(sgkf.split(all_ppg, all_labels)):
         
         mylogger.info(f"\n{'='*20} FOLD {fold+1}/{args.k_folds} {'='*20}")
 
-        # Hold out 1/8 of the training pool for validation.
+        # 1. Create Datasets and DataLoaders for the current fold
+
         sgkf2 = StratifiedKFold(n_splits=8, shuffle=True, random_state=args.seed)
+        # sgkf2 = KFold(n_splits=8, shuffle=True, random_state=args.seed)
         
         train_val_ppg = all_ppg[train_val_idx]
         train_val_labels = all_labels[train_val_idx]
         train_val_patient_ids = all_patient_ids[train_val_idx]
-        (train_idx, val_idx) = next(iter(sgkf2.split(train_val_ppg, train_val_labels)))
+        (train_idx, val_idx) = next(iter(sgkf2.split(train_val_ppg, train_val_labels))) # 
 
         mylogger.info(f'Train vs Val vs Test: {len(train_idx)}, {len(val_idx)}, {len(test_idx)}')
         mylogger.info('F1 vs AUROC vs ACC')
@@ -352,7 +364,7 @@ def run_linear_probe_random(args, h5_buffer):
         val_loader = DataLoader(val_dataset, batch_size=args.batch_size)
         test_loader = DataLoader(test_dataset, batch_size=args.batch_size) 
         
-        # Fresh probe and optimizer for each fold.
+        # 2. Re-initialize the model and optimizer for each fold
         probe_model = LinearProbeModel(backbone, args.num_classes).to(device)
         optimizer = torch.optim.Adam(probe_model.classifier.parameters(), lr=args.learning_rate)
         criterion = nn.CrossEntropyLoss()
@@ -360,7 +372,7 @@ def run_linear_probe_random(args, h5_buffer):
         best_val_loss = float('inf')
         best_model_weights = None
         last_update = 0
-        # Train with early stopping on validation loss.
+        # --- Inner Training & Validation Loop ---
         for epoch in range(args.epochs):
             probe_model.train()
             for data, labels in tqdm(train_loader, desc=f'Epoch {epoch+1}'):
@@ -373,6 +385,7 @@ def run_linear_probe_random(args, h5_buffer):
 
             probe_model.eval()
             total_val_loss = 0
+            # mylogger.info("Validating...")
             with torch.no_grad():
                 for data, labels in val_loader:
                     data, labels = data.to(device), labels.to(device)
@@ -385,13 +398,15 @@ def run_linear_probe_random(args, h5_buffer):
                 best_val_loss = avg_val_loss
                 best_model_weights = copy.deepcopy(probe_model.state_dict())
                 last_update = epoch
+                # mylogger.info(f'Best weight found at Epoch {epoch+1}: {best_val_loss}')
 
             if epoch - last_update > args.patience:
+                # mylogger.info(f'Stopped at Epoch: {epoch+1}')
                 break
         
         mylogger.info(f"Fold {fold+1} Best Val Loss: {best_val_loss:.4f}")
 
-        # Evaluate the best checkpoint of this fold on the held-out test fold.
+        # 3. Evaluate the best model of this fold on its validation set
         probe_model.load_state_dict(best_model_weights)
         probe_model.eval()
 
@@ -416,10 +431,15 @@ def run_linear_probe_random(args, h5_buffer):
         fold_metrics['auroc'].append(auroc.compute().item())
         fold_metrics['acc'].append(acc.compute().item())
         
+        # mylogger.info(f"Fold {fold+1} F1: {fold_metrics['f1'][-1]:.4f}, AUROC: {fold_metrics['auroc'][-1]:.4f}, Acc: {fold_metrics['acc'][-1]:.4f}")
         mylogger.info(f"{fold_metrics['f1'][-1]:.4f} {fold_metrics['auroc'][-1]:.4f} {fold_metrics['acc'][-1]:.4f}")
 
-    # Mean ± std across folds: F1, AUROC, accuracy.
+    # --- Final Aggregated Results ---
     mylogger.info(f"\n{'='*20} K-Fold Cross-Validation Results ({args.k_folds} Folds) {'='*20}")
+    # mylogger.info(f"Average F1 Score:    {np.mean(fold_metrics['f1']):.4f} ± {np.std(fold_metrics['f1']):.4f}")
+    # mylogger.info(f"Average AUROC:       {np.mean(fold_metrics['auroc']):.4f} ± {np.std(fold_metrics['auroc']):.4f}")
+    # mylogger.info(f"Average Acc:         {np.mean(fold_metrics['acc']):.4f} ± {np.std(fold_metrics['acc']):.4f}")
+
     mylogger.info(f"{np.mean(fold_metrics['f1']):.4f} ± {np.std(fold_metrics['f1']):.4f}")
     mylogger.info(f"{np.mean(fold_metrics['auroc']):.4f} ± {np.std(fold_metrics['auroc']):.4f}")
     mylogger.info(f"{np.mean(fold_metrics['acc']):.4f} ± {np.std(fold_metrics['acc']):.4f}")
@@ -429,14 +449,15 @@ def run_linear_probe_random(args, h5_buffer):
 
 
 def run_linear_probe_by_patient(args, h5_buffer):
-    """Linear-probe k-fold CV with patient-level splits; metrics are averaged per patient."""
+    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     mylogger.info(f"Using device: {device}")
     
+    ''' data loader '''
     all_ppg, all_patient_ids, all_labels = prepare_data(args, h5_buffer)
 
     
-    # Load backbone weights from the Lightning checkpoint.
+    ''' backbone loader '''
     backbone = get_model(args.cfg)
     checkpoint = torch.load(args.ckpt_path, map_location=device)
     lightning_state_dict = checkpoint['state_dict']
@@ -445,16 +466,19 @@ def run_linear_probe_by_patient(args, h5_buffer):
     mylogger.info("Backbone loaded successfully.")
 
 
-    # Split by patient so no participant appears in both train and test.
+    # --- K-Fold Cross-Validation Setup ---
+    # Use StratifiedGroupKFold to split by patient, ensuring no data leakage
     sgkf = StratifiedGroupKFold(n_splits=args.k_folds, shuffle=True, random_state=args.seed)
+    # GroupKFold
     
     fold_metrics = {'f1': [], 'auroc': [], 'per_patient_acc': [], 'acc': []}
 
+    # --- Main K-Fold Loop ---
     for fold, (train_val_idx, test_idx) in enumerate(sgkf.split(all_ppg, all_labels, groups=all_patient_ids)):
         
         mylogger.info(f"\n{'='*20} FOLD {fold+1}/{args.k_folds} {'='*20}")
         
-        # Patient-level validation split within the training pool.
+        # GroupKFold
         sgkf2 = StratifiedGroupKFold(n_splits=8, shuffle=True, random_state=args.seed)
         
         train_val_ppg = all_ppg[train_val_idx]
@@ -475,7 +499,7 @@ def run_linear_probe_by_patient(args, h5_buffer):
         val_loader = DataLoader(val_dataset, batch_size=args.batch_size)
         test_loader = DataLoader(test_dataset, batch_size=args.batch_size) 
         
-        # Fresh probe and optimizer for each fold.
+        # 2. Re-initialize the model and optimizer for each fold
         probe_model = LinearProbeModel(backbone, args.num_classes).to(device)
         optimizer = torch.optim.Adam(probe_model.classifier.parameters(), lr=args.learning_rate)
         criterion = nn.CrossEntropyLoss()
@@ -484,7 +508,7 @@ def run_linear_probe_by_patient(args, h5_buffer):
         best_model_weights = None
 
         last_update = 0
-        # Train with early stopping on validation loss.
+        # --- Inner Training & Validation Loop ---
         for epoch in range(args.epochs):
             probe_model.train()
             for data, labels in tqdm(train_loader, desc=f'Epoch {epoch+1}'):
@@ -497,6 +521,7 @@ def run_linear_probe_by_patient(args, h5_buffer):
 
             probe_model.eval()
             total_val_loss = 0
+            # mylogger.info("Validating...")
             with torch.no_grad():
                 for data, labels in val_loader:
                     data, labels = data.to(device), labels.to(device)
@@ -510,17 +535,20 @@ def run_linear_probe_by_patient(args, h5_buffer):
                 best_val_loss = avg_val_loss
                 best_model_weights = copy.deepcopy(probe_model.state_dict())
                 last_update = epoch
+                # mylogger.info(f'Best weight found at Epoch {epoch+1}: {best_val_loss}')
 
             if epoch - last_update > args.patience:
+                # mylogger.info(f'Stopped at Epoch: {epoch+1}')
                 break
         
         mylogger.info(f"Fold {fold+1} Best Val Loss: {best_val_loss:.4f}")
 
 
-        # Evaluate the best checkpoint of this fold on the held-out test fold.
+        # 3. Evaluate the best model of this fold on its validation set
         probe_model.load_state_dict(best_model_weights)
         probe_model.eval()
 
+        # Store all results from the GPU pass
         all_test_preds = []
         all_test_probs = []
         all_test_labels = []
@@ -530,7 +558,7 @@ def run_linear_probe_by_patient(args, h5_buffer):
                 data = data.to(device)
                 outputs = probe_model(data)
                 preds = torch.argmax(outputs, dim=1)
-                probs = torch.softmax(outputs, dim=1)[:, 1]  # probability of the positive class
+                probs = torch.softmax(outputs, dim=1)[:, 1] # positive is 1
                 
                 all_test_preds.extend(preds.cpu().numpy())
                 all_test_probs.extend(probs.cpu().numpy())
@@ -542,10 +570,15 @@ def run_linear_probe_by_patient(args, h5_buffer):
         fold_metrics['auroc'].append(auroc)
         fold_metrics['acc'].append(acc)
         
+        # mylogger.info(f"Fold {fold+1} F1: {fold_metrics['f1'][-1]:.4f}, AUROC: {fold_metrics['auroc'][-1]:.4f}, Acc: {fold_metrics['acc'][-1]:.4f}")
         mylogger.info(f"{fold_metrics['f1'][-1]:.4f} {fold_metrics['auroc'][-1]:.4f} {fold_metrics['acc'][-1]:.4f}")
 
-    # Mean ± std across folds: F1, AUROC, accuracy.
+    # --- Final Aggregated Results ---
     mylogger.info(f"\n{'='*20} By-Patient K-Fold Cross-Validation Results ({args.k_folds} Folds {'='*20}")
+    # mylogger.info(f"Average F1 Score:   {np.mean(fold_metrics['f1']):.4f} ± {np.std(fold_metrics['f1']):.4f}")
+    # mylogger.info(f"Average AUROC:      {np.mean(fold_metrics['auroc']):.4f} ± {np.std(fold_metrics['auroc']):.4f}")
+    # mylogger.info(f"Average Acc:        {np.mean(fold_metrics['acc']):.4f} ± {np.std(fold_metrics['acc']):.4f}")
+    
     mylogger.info(f"{np.mean(fold_metrics['f1']):.4f} ± {np.std(fold_metrics['f1']):.4f}")
     mylogger.info(f"{np.mean(fold_metrics['auroc']):.4f} ± {np.std(fold_metrics['auroc']):.4f}")
     mylogger.info(f"{np.mean(fold_metrics['acc']):.4f} ± {np.std(fold_metrics['acc']):.4f}")
@@ -554,46 +587,40 @@ if __name__ == '__main__':
     
  
     parser = argparse.ArgumentParser(
-        description="Linear-probe evaluation of a pretrained backbone on a binary downstream task."
+        description="A simple script to demonstrate argparse."
     )
 
     parser.add_argument(
         '--source', 
         type=str, 
-        default='ppg+ecg',
-        help="Input modality: 'ppg', 'ecg', or 'ppg+ecg'.",
+        default='ppg+ecg', 
     )
     
     parser.add_argument(
         '--model',
         type = str, 
-        default='himae',
-        help="Backbone: 'himae', 'himae_25m', 'himae_pulsedb', or a PulseBridge variant.",
+        default='himae', 
     )
     parser.add_argument(
         '--app',
         type = str, 
-        default='pvc',
-        help="Downstream task key in TASK_DEF (e.g., 'pvc', 'element').",
+        default='pvc', 
     )
     
     parser.add_argument(
         '--split',
         type = str, 
-        default='random',
-        help="Cross-validation split: 'random' (segment-level) or 'patient'.",
+        default='random', 
     )
     parser.add_argument(
         '--batch',
         type = int, 
-        default=2048,
-        help='Batch size.',
+        default=2048, 
     )
     parser.add_argument(
         '--epoch',
         type = int, 
-        default=7,
-        help='Maximum training epochs per fold.',
+        default=7, 
     )
     
     inputs = parser.parse_args()
@@ -614,18 +641,18 @@ if __name__ == '__main__':
         num_classes = 2
         k_folds = 5
         seed = 77
-        to_summary = False  # set True to write dataset summary files
+        to_summary = False # True        
         patience = 5
         learning_rate = 1e-3
         
         
         epochs     = inputs.epoch
         batch_size = inputs.batch
-        app        = inputs.app
-        by         = inputs.split
+        app        = inputs.app # pvc element
+        by         = inputs.split # 'random'
 
         cfg = {
-            'model': inputs.model,
+            'model': inputs.model, # himae pulsebridge_mae pulsebridge_full
             'sampling_freq': 100,
             'seg_len': 10,   
             'source': inputs.source,
@@ -642,7 +669,7 @@ if __name__ == '__main__':
                   'use_fir_prior': True,         
                   'fir_kernel_size': 9,          
                   'fir_bandwidth': 2,           
-                  'patch_len': 40,
+                  'patch_len': 5,  # PAPER_CONFIG['patch_len']
             },
         }
 

@@ -19,11 +19,12 @@ The repository is intended as a research implementation of the core model and ev
 The root directory includes a pretraining checkpoint, a reference linear probe, a small metadata CSV for the synthetic PVC task, example predictions, and a demonstration notebook.
 
 ```text
-HiMAE_PVC_Detection.ipynb        <- end-to-end wiring for PVC linear probe
-himae_synth.ckpt                 <- Lightning checkpoint for HiMAE backbone
-pvc_linear_probe.pt              <- state_dict for reference linear probe
+HiMAE_PVC_Detection.ipynb        <- end-to-end PVC demo: paper config, bottleneck probe, multi-resolution probes
+himae_synth.ckpt                 <- Lightning checkpoint for HiMAE backbone (100 Hz, patch 5, [16..256])
+pvc_linear_probe.pt              <- reference linear probe (earlier demo version, see "Reference Results")
+pvc_10s_synth.h5                 <- synthetic PVC windows (stored at 25 Hz; resampled to 100 Hz on load)
 pvc_10s_synth_metadata.csv       <- example metadata (fs=25 Hz, 10 s windows)
-pvc_predictions.csv              <- example inference outputs (p_pvc per segment)
+pvc_predictions.csv              <- example inference outputs (earlier demo version, see "Reference Results")
 
 pretrain/
     himae.py                     <- minimal Lightning trainer for masked AE
@@ -39,17 +40,24 @@ analysis/
     merge_predictions.py             <- concatenate per-model prediction exports
     run_statistical_workflow.sh      <- end-to-end statistical workflow
 
-plot/                                <- Fig. 1-4 and Extended Data Fig. 1-3 plotting
+plot/                                <- Fig. 1-4, Extended Data Fig. 1-3, multi-resolution plotting
+    fig_multiresolution.py           <- test AUROC by encoder stage / receptive field
+
+tests/
+    test_architecture.py             <- checks code + checkpoint against the main-text configuration
 
 pvc/
     utils/                       <- logger and model registry
-    helper_logger.py
-    helper_models.py
-    model_arch/
-        himae.py                 <- 1-D CNN HiMAE backbone (encoder/decoder)
+        helper_logger.py
+        helper_models.py
+        signal_utils.py          <- load, resample to 100 Hz, normalize, participant-disjoint split
+        model_arch/
+            himae.py             <- HiMAE backbone + PAPER_CONFIG (single source of truth);
+                                    encode()/embed_multiresolution() return per-stage embeddings
     downstream_eval/
-        binary_linear_prob.py    <- script for linear probe training/eval
-        fewshot_finetune.py      <- fewshot and fintune training/eval
+        binary_linear_prob.py    <- linear probe training/eval (original research environment)
+        fewshot_finetune.py      <- few-shot and fine-tune training/eval (--embedding-stage)
+        multiresolution_probe.py <- per-stage (per-resolution) linear probes + bootstrap CIs
         helpers.py               <- analysis utilities
 
 LICENSE
@@ -183,15 +191,15 @@ Downstream PVC evaluation expects an HDF5 file with contiguous datasets for sign
 - `/labels` with shape `[N]` containing binary labels
 - optionally `/patient_ids` with shape `[N]`
 
-The included `pvc_10s_synth_metadata.csv` describes synthetic segments sampled at 25 Hz with 10-second windows (`L = 250`) and a binary `pvc` label.
+The included `pvc_10s_synth.h5` stores synthetic segments at 25 Hz with 10-second windows (`L = 250`) and a binary label; `pvc_10s_synth_metadata.csv` describes them.
 
-The demonstration notebook shows how to use either an HDF5 file in this format or synthetic tensors generated within the notebook.
+HiMAE was pretrained on 10-second windows at 100 Hz (1,000 samples). All downstream entry points therefore resample stored windows to 100 Hz and min-max normalize each window to [-1, 1] before the forward pass (`pvc/utils/signal_utils.py`). The stored rate is inferred from the window length, or set explicitly with `--input-fs` / `INPUT_FS`.
 
 ---
 
 # Demo: PVC Linear Probe
 
-The PVC demo freezes the pretrained encoder and fits or loads a single logistic layer on top of mean-pooled bottleneck features.
+The PVC demo freezes the pretrained encoder and fits a single logistic layer on top of mean-pooled bottleneck features, then repeats the probe on every encoder stage (multi-resolution embeddings). Participants are split into disjoint train / validation / test sets (`SPLIT_SEED = 77`), and test AUROC is reported on held-out participants.
 
 The simplest route is the Jupyter notebook:
 
@@ -209,27 +217,25 @@ HiMAE_PVC_Detection.ipynb
    ```
 
 3. Open `HiMAE_PVC_Detection.ipynb`.
-4. Set the following notebook variables as needed:
-   - `H5_PATH`
-   - `META_PATH`
-   - `SIGNAL_KEY` (`ppg` or `ecg`)
-   - configuration values in the `CFG` block
-5. For the included synthetic example, use the provided 25 Hz sampling frequency and 10-second segment duration.
-6. Point the backbone to:
+4. Set `H5_PATH`, `SIGNAL_KEY` (`ppg` or `ecg`) and, if needed, `INPUT_FS`. `CFG` is built from `PAPER_CONFIG` (100 Hz, 10 s, channels [16, 32, 64, 128, 256], kernel 5, stride 2, patch 5) and should not need editing.
+5. Point `BACKBONE_CKPT` to `himae_synth.ckpt`.
+6. Run all cells in order. The probe and predictions are written to `results/`.
 
-   ```text
-   himae_synth.ckpt
-   ```
+The same analyses are available as scripts:
 
-7. Point the reference probe to:
+```bash
+# per-stage (multi-resolution) linear probes with participant-level bootstrap CIs
+python pvc/downstream_eval/multiresolution_probe.py --h5 pvc_10s_synth.h5 --checkpoint himae_synth.ckpt \
+  --task PVC --output-dir results/multiresolution
+python plot/fig_multiresolution.py --input results/multiresolution/multires_probe_summary.csv --output-dir figures
 
-   ```text
-   pvc_linear_probe.pt
-   ```
+# frozen + few-shot fine-tuning; --embedding-stage last | 1..5 | all
+python pvc/downstream_eval/fewshot_finetune.py --h5 pvc_10s_synth.h5 --checkpoint himae_synth.ckpt \
+  --shots 256 512 1024 2048 all --runs 5 --include-frozen --output results/finetuning.csv
 
-8. Run all cells in order.
-
-The notebook can either load the provided reference probe or fit a new linear probe on extracted HiMAE embeddings.
+# configuration checks
+python -m pytest tests -q
+```
 
 If a pure-script workflow is preferred, the corresponding evaluation logic is implemented in:
 
@@ -252,22 +258,25 @@ A successful run should:
 - calculate aggregate binary-classification performance; and
 - optionally write a CSV containing identifiers, labels, and predicted PVC probabilities.
 
-When using the provided example files, the output CSV follows the structure:
+The notebook writes `results/pvc_predictions.csv` with the structure:
 
 ```text
-patient_id,label,p_pvc
+patient_id,sample_id,split,label,p_pvc
 ...
 ```
 
-The provided `pvc_predictions.csv` contains **11,172 synthetic segments**, including **515 positive PVC segments** (4.61% prevalence).
-
-The expected aggregate sanity-check performance is approximately:
+On the included synthetic example (55,861 windows, 18 participants; test split 11,209 windows from 4 participants), the expected output is approximately:
 
 ```text
-ROC-AUC: 0.766
+Bottleneck (stage 5) linear probe   test ROC-AUC: 0.909   (validation 0.903)
+
+Per-stage probes (test ROC-AUC; receptive field):
+  stage 1  0.745  (130 ms)     stage 4  0.830  (1.81 s)
+  stage 2  0.848  (370 ms)     stage 5  0.907  (3.73 s)
+  stage 3  0.832  (850 ms)     all stages concatenated  0.903
 ```
 
-Small numerical differences may occur across environments or when a new linear probe is trained rather than loading the provided reference probe.
+Small numerical differences may occur across hardware and library versions.
 
 ## Expected demo runtime
 
@@ -283,9 +292,7 @@ These timings refer only to the included demonstration and not to full-scale HiM
 
 # Reference Results
 
-The included `pvc_predictions.csv` contains 11,172 synthetic segments with a PVC prevalence of 4.61% (515 positives). Using the provided backbone and a simple linear probe, the aggregate metric on that split is:
-
-- ROC-AUC approximately **0.766**
+The released `pvc_predictions.csv` and `pvc_linear_probe.pt` were produced by an earlier version of the demo notebook, which fed the stored 25 Hz windows to the backbone without resampling to the 100 Hz pretraining rate and split windows at random rather than by participant. `pvc_predictions.csv` contains 11,172 synthetic segments with a PVC prevalence of 4.61% (515 positives), with ROC-AUC approximately **0.766** on that split. The current notebook uses the pretraining configuration and a participant-disjoint split, and writes its outputs to `results/` without modifying these files (see "Expected Demo Output").
 
 This synthetic example is intended as a functional sanity check of the model-loading and evaluation pipeline. It is not intended to reproduce the quantitative clinical performance reported in the manuscript.
 
