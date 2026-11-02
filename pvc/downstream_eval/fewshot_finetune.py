@@ -1,0 +1,448 @@
+"""Generate long-form few-shot AUROC CSVs consumed by ``plot/fig4.py``.
+
+Inputs are resampled to the pretraining configuration (PAPER_CONFIG: 100 Hz,
+10-second windows, patch size 5) before every forward pass. The stored sampling
+rate is inferred from the window length unless --input-fs is given.
+
+Example (synthetic PVC files shipped with this repository; 25 Hz -> 100 Hz)::
+
+    python pvc/downstream_eval/fewshot_finetune.py \
+        --h5 pvc_10s_synth.h5 \
+        --checkpoint himae_synth.ckpt \
+        --dataset PVC \
+        --model-name "HiMAE (1.2M)" \
+        --shots 256 512 1024 2048 all \
+        --runs 3 \
+        --include-frozen \
+        --output results/finetuning_himae.csv
+
+The resulting file can be passed directly to::
+
+    python plot/fig4.py --input results/finetuning_himae.csv --output-dir figures
+
+With --predictions-output, per-window validation and test scores of one run
+(--predictions-run) are also written in the canonical prediction schema
+(analysis/prediction_schema.py): regime "Frozen" for the frozen linear probe
+(requires --include-frozen) and "Fine-tuned" for shots=all. That file is the
+input of analysis/run_statistical_workflow.sh.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import random
+import sys
+from pathlib import Path
+from typing import Iterable
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from sklearn.metrics import roc_auc_score
+from torch.utils.data import DataLoader, Dataset
+
+# Allow execution from anywhere inside/outside the repository.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+for _p in (REPO_ROOT, REPO_ROOT / "analysis"):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+
+from pvc.utils.model_arch.himae import HiMAE, PAPER_CONFIG  # noqa: E402
+from pvc.utils.signal_utils import load_h5_windows, participant_disjoint_split  # noqa: E402
+from prediction_schema import make_predictions_frame, window_ids_within_participant  # noqa: E402
+
+
+OUTPUT_COLUMNS = ["dataset", "model", "shots", "run", "auc"]
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run frozen linear-probe and few-shot fine-tuning experiments."
+    )
+    parser.add_argument("--h5", type=Path, required=True)
+    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--output", type=Path, default=REPO_ROOT / "results" / "finetuning.csv")
+    parser.add_argument("--dataset", default="PVC")
+    parser.add_argument("--model-name", default="HiMAE (1.2M)")
+    parser.add_argument("--signal-key", default="ppg")
+    parser.add_argument("--label-key", default="labels")
+    parser.add_argument("--patient-key", default="patient_ids")
+    parser.add_argument("--input-fs", type=int, default=None,
+                        help="Sampling rate of the stored windows (inferred from length if omitted).")
+    parser.add_argument("--sampling-freq", type=int, default=PAPER_CONFIG["sampling_freq"],
+                        help="Model input rate; windows are resampled to this rate.")
+    parser.add_argument("--segment-seconds", type=int, default=PAPER_CONFIG["seg_len"])
+    parser.add_argument("--patch-len", type=int, default=PAPER_CONFIG["patch_len"])
+    parser.add_argument("--embedding-stage", default="last",
+                        help='Encoder stage pooled for the classifier: "last" (bottleneck), '
+                             'a stage number 1-5, or "all" (concatenation of all stages).')
+    parser.add_argument(
+        "--shots",
+        nargs="+",
+        default=["256", "512", "1024", "2048", "all"],
+        help='Fine-tuning sample counts. Use integers and/or "all".',
+    )
+    parser.add_argument("--runs", type=int, default=5)
+    parser.add_argument(
+        "--include-frozen",
+        action="store_true",
+        help="Also emit shots=0 frozen-encoder linear-probe runs.",
+    )
+    parser.add_argument("--split-seed", type=int, default=77)
+    parser.add_argument("--run-seed", type=int, default=1000)
+    parser.add_argument("--test-fraction", type=float, default=0.20)
+    parser.add_argument("--val-fraction", type=float, default=0.20)
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--patience", type=int, default=5)
+    parser.add_argument("--probe-lr", type=float, default=1e-3)
+    parser.add_argument("--finetune-lr", type=float, default=1e-4)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument(
+        "--append",
+        action="store_true",
+        help="Append to an existing CSV and de-duplicate dataset/model/shots/run rows.",
+    )
+    parser.add_argument("--predictions-output", type=Path, default=None,
+                        help="Write canonical val/test predictions (Frozen and Fine-tuned shots=all) here.")
+    parser.add_argument("--predictions-run", type=int, default=0,
+                        help="Run index whose predictions are exported with --predictions-output.")
+    parser.add_argument(
+        "--device",
+        default="auto",
+        choices=["auto", "cpu", "cuda", "mps"],
+    )
+    return parser.parse_args()
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def choose_device(name: str) -> torch.device:
+    if name != "auto":
+        return torch.device(name)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+class ArrayDataset(Dataset):
+    def __init__(self, x: np.ndarray, y: np.ndarray, indices: np.ndarray):
+        self.x = x
+        self.y = y
+        self.indices = np.asarray(indices, dtype=np.int64)
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __getitem__(self, item: int) -> tuple[torch.Tensor, torch.Tensor]:
+        idx = self.indices[item]
+        return torch.from_numpy(self.x[idx]).float(), torch.tensor(self.y[idx]).float()
+
+
+class EncoderClassifier(nn.Module):
+    """Linear head on a time-pooled encoder stage (or the concatenation of all stages)."""
+
+    def __init__(self, backbone: HiMAE, stage: str = "last"):
+        super().__init__()
+        self.backbone = backbone
+        n = len(backbone.channels)
+        if stage == "last":
+            self.stages = [n - 1]
+        elif stage == "all":
+            self.stages = list(range(n))
+        else:
+            k = int(stage)
+            if not 1 <= k <= n:
+                raise ValueError(f"--embedding-stage must be 1..{n}, 'last' or 'all'")
+            self.stages = [k - 1]
+        self.classifier = nn.Linear(sum(backbone.channels[i] for i in self.stages), 1)
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        feats = self.backbone.encode(x.unsqueeze(1) if x.ndim == 2 else x)
+        return torch.cat([feats[i].mean(dim=-1) for i in self.stages], dim=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.classifier(self.encode(x)).squeeze(-1)
+
+
+def build_backbone(args: argparse.Namespace, device: torch.device) -> HiMAE:
+    cfg = {
+        "source": args.signal_key,
+        "sampling_freq": args.sampling_freq,
+        "seg_len": args.segment_seconds,
+        "model_params": {"patch_len": args.patch_len},
+    }
+    backbone = HiMAE(cfg)
+    state = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    state_dict = state.get("state_dict", state) if isinstance(state, dict) else state
+
+    cleaned = {}
+    for key, value in state_dict.items():
+        new_key = key
+        for prefix in ("model.", "backbone.", "net.", "module."):
+            if new_key.startswith(prefix):
+                new_key = new_key[len(prefix) :]
+                break
+        cleaned[new_key] = value
+
+    missing, unexpected = backbone.load_state_dict(cleaned, strict=False)
+    encoder_missing = [k for k in missing if k.startswith("encoder_layers")]
+    if encoder_missing:
+        raise RuntimeError(f"Checkpoint is missing encoder weights: {encoder_missing[:5]}")
+    if unexpected:
+        print(f"Warning: ignored {len(unexpected)} unexpected checkpoint keys.")
+    return backbone.to(device)
+
+
+def make_loader(
+    x: np.ndarray,
+    y: np.ndarray,
+    indices: np.ndarray,
+    batch_size: int,
+    shuffle: bool,
+) -> DataLoader:
+    return DataLoader(
+        ArrayDataset(x, y, indices),
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=0,
+        pin_memory=torch.cuda.is_available(),
+    )
+
+
+@torch.no_grad()
+@torch.no_grad()
+def predict(model: EncoderClassifier, loader: DataLoader, device: torch.device) -> tuple[np.ndarray, np.ndarray]:
+    """Labels and positive-class probabilities, in loader order."""
+    model.eval()
+    ys, scores = [], []
+    for xb, yb in loader:
+        ys.append(yb.numpy())
+        scores.append(torch.sigmoid(model(xb.to(device))).cpu().numpy())
+    return np.concatenate(ys), np.concatenate(scores)
+
+
+def evaluate_auc(model: EncoderClassifier, loader: DataLoader, device: torch.device) -> float:
+    return float(roc_auc_score(*predict(model, loader, device)))
+
+
+def train_model(
+    model: EncoderClassifier,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    device: torch.device,
+    lr: float,
+    weight_decay: float,
+    epochs: int,
+    patience: int,
+    freeze_encoder: bool,
+) -> EncoderClassifier:
+    for parameter in model.backbone.parameters():
+        parameter.requires_grad_(not freeze_encoder)
+
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable, lr=lr, weight_decay=weight_decay)
+    criterion = nn.BCEWithLogitsLoss()
+
+    best_auc = -np.inf
+    best_state = None
+    stale = 0
+
+    for _epoch in range(epochs):
+        model.train()
+        if freeze_encoder:
+            model.backbone.eval()  # keep BatchNorm frozen for a true linear probe
+        for xb, yb in train_loader:
+            xb = xb.to(device)
+            yb = yb.to(device)
+            logits = model(xb)
+            loss = criterion(logits, yb)
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+
+        val_auc = evaluate_auc(model, val_loader, device)
+        if val_auc > best_auc + 1e-6:
+            best_auc = val_auc
+            best_state = copy.deepcopy(model.state_dict())
+            stale = 0
+        else:
+            stale += 1
+        if stale >= patience:
+            break
+
+    if best_state is None:
+        raise RuntimeError("Training did not produce a valid checkpoint.")
+    model.load_state_dict(best_state)
+    return model
+
+
+def stratified_subsample(indices: np.ndarray, y: np.ndarray, n: int, seed: int) -> np.ndarray:
+    if n >= len(indices):
+        return np.asarray(indices)
+    rng = np.random.default_rng(seed)
+    indices = np.asarray(indices)
+    pos = indices[y[indices] == 1]
+    neg = indices[y[indices] == 0]
+
+    # Preserve the training prevalence while guaranteeing both classes whenever n >= 2.
+    n_pos = int(round(n * len(pos) / len(indices)))
+    n_pos = min(max(n_pos, 1), len(pos), n - 1)
+    n_neg = n - n_pos
+    if n_neg > len(neg):
+        n_neg = len(neg)
+        n_pos = n - n_neg
+    chosen = np.concatenate(
+        [rng.choice(pos, size=n_pos, replace=False), rng.choice(neg, size=n_neg, replace=False)]
+    )
+    rng.shuffle(chosen)
+    return chosen
+
+
+def normalize_shots(values: Iterable[str]) -> list[str]:
+    normalized = []
+    for value in values:
+        text = str(value).strip().lower()
+        if text == "all":
+            normalized.append("all")
+        else:
+            n = int(text)
+            if n <= 0:
+                raise ValueError("Positive fine-tuning shot counts are required; use --include-frozen for shots=0.")
+            normalized.append(str(n))
+    return list(dict.fromkeys(normalized))
+
+
+def row(dataset: str, model: str, shots: str, run: int, auc: float) -> dict[str, object]:
+    return {"dataset": dataset, "model": model, "shots": shots, "run": run, "auc": auc}
+
+
+def save_rows(rows: list[dict[str, object]], path: Path, append: bool) -> None:
+    new_df = pd.DataFrame(rows, columns=OUTPUT_COLUMNS)
+    if append and path.exists():
+        old_df = pd.read_csv(path)
+        missing = set(OUTPUT_COLUMNS).difference(old_df.columns)
+        if missing:
+            raise ValueError(f"Existing output is missing columns: {sorted(missing)}")
+        new_df = pd.concat([old_df[OUTPUT_COLUMNS], new_df], ignore_index=True)
+        new_df = new_df.drop_duplicates(
+            subset=["dataset", "model", "shots", "run"], keep="last"
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    new_df.to_csv(path, index=False)
+
+
+def main() -> None:
+    args = parse_args()
+    device = choose_device(args.device)
+    shots = normalize_shots(args.shots)
+    print(f"Device: {device}")
+
+    x, y, patient_ids = load_h5_windows(
+        args.h5, args.signal_key, args.label_key, args.patient_key,
+        input_fs=args.input_fs, model_fs=args.sampling_freq, seg_len=args.segment_seconds,
+    )
+    train_idx, val_idx, test_idx = participant_disjoint_split(
+        y,
+        patient_ids,
+        test_fraction=args.test_fraction,
+        val_fraction=args.val_fraction,
+        seed=args.split_seed,
+    )
+    print(
+        f"Split windows: train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)}; "
+        f"participants={len(np.unique(patient_ids))}"
+    )
+
+    val_loader = make_loader(x, y, val_idx, args.batch_size, shuffle=False)
+    test_loader = make_loader(x, y, test_idx, args.batch_size, shuffle=False)
+    rows: list[dict[str, object]] = []
+    sample_id = window_ids_within_participant(patient_ids)
+    exported = []
+
+    def export(model: EncoderClassifier, regime: str) -> None:
+        for split, idx, loader in (("val", val_idx, val_loader), ("test", test_idx, test_loader)):
+            _, scores = predict(model, loader, device)
+            exported.append(make_predictions_frame(args.dataset, args.model_name, regime, split,
+                                                   patient_ids[idx], sample_id[idx], y[idx], scores))
+
+    def export_this_run(run: int) -> bool:
+        return args.predictions_output is not None and run == args.predictions_run
+
+    if args.predictions_output is not None and "all" not in shots:
+        raise ValueError("--predictions-output exports the Fine-tuned regime from shots=all; include 'all' in --shots.")
+
+    for run in range(args.runs):
+        seed = args.run_seed + run
+        set_seed(seed)
+
+        if args.include_frozen:
+            backbone = build_backbone(args, device)
+            model = EncoderClassifier(backbone, args.embedding_stage).to(device)
+            frozen_train_loader = make_loader(
+                x, y, train_idx, args.batch_size, shuffle=True
+            )
+            model = train_model(
+                model,
+                frozen_train_loader,
+                val_loader,
+                device,
+                lr=args.probe_lr,
+                weight_decay=args.weight_decay,
+                epochs=args.epochs,
+                patience=args.patience,
+                freeze_encoder=True,
+            )
+            auc = evaluate_auc(model, test_loader, device)
+            rows.append(row(args.dataset, args.model_name, "0", run, auc))
+            print(f"run={run} shots=0 test_auc={auc:.4f}")
+            if export_this_run(run):
+                export(model, "Frozen")
+
+        for shot in shots:
+            set_seed(seed)
+            subset = (
+                train_idx
+                if shot == "all"
+                else stratified_subsample(train_idx, y, int(shot), seed)
+            )
+            train_loader = make_loader(x, y, subset, args.batch_size, shuffle=True)
+            backbone = build_backbone(args, device)
+            model = EncoderClassifier(backbone, args.embedding_stage).to(device)
+            model = train_model(
+                model,
+                train_loader,
+                val_loader,
+                device,
+                lr=args.finetune_lr,
+                weight_decay=args.weight_decay,
+                epochs=args.epochs,
+                patience=args.patience,
+                freeze_encoder=False,
+            )
+            auc = evaluate_auc(model, test_loader, device)
+            rows.append(row(args.dataset, args.model_name, shot, run, auc))
+            print(f"run={run} shots={shot} n_train={len(subset)} test_auc={auc:.4f}")
+            if shot == "all" and export_this_run(run):
+                export(model, "Fine-tuned")
+
+    save_rows(rows, args.output, args.append)
+    print(f"Saved {len(rows)} rows to {args.output}")
+    if exported:
+        args.predictions_output.parent.mkdir(parents=True, exist_ok=True)
+        pd.concat(exported, ignore_index=True).to_csv(args.predictions_output, index=False)
+        print(f"Saved canonical predictions to {args.predictions_output}")
+
+
+if __name__ == "__main__":
+    main()
